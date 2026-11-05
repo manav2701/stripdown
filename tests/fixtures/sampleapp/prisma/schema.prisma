@@ -1,0 +1,11 @@
+model User {
+  id String @id
+}
+
+model Invoice {
+  id String @id
+}
+
+model WeeklyDigest {
+  id String @id
+}

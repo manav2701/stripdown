@@ -1,0 +1,10 @@
+{
+  "name": "sampleapp",
+  "dependencies": {
+    "next": "14.2.3",
+    "posthog-js": "1.131.3",
+    "launchdarkly-node-server-sdk": "7.0.3",
+    "stripe": "15.7.0",
+    "express": "4.19.2"
+  }
+}

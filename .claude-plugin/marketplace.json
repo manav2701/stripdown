@@ -1,0 +1,14 @@
+{
+  "name": "stripdown",
+  "description": "strip-down: find the features that are not earning their keep.",
+  "owner": { "name": "manav2701", "url": "https://github.com/manav2701" },
+  "plugins": [
+    {
+      "name": "strip-down",
+      "source": "./",
+      "description": "Builds a feature inventory from your codebase, prices each feature from git history, and joins both against product usage data to show which features are earning their keep.",
+      "category": "product",
+      "tags": ["analytics", "feature-audit", "technical-debt", "product-management"]
+    }
+  ]
+}

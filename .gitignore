@@ -1,0 +1,14 @@
+# strip-down's eval output
+results/
+results.json
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+.DS_Store
+*.swp
+
+# NOTE: .stripdown/ is deliberately NOT ignored. The feature inventory is meant
+# to be committed and reviewed in pull requests like any other source file.
