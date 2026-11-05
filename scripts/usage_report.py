@@ -175,12 +175,19 @@ def signature(row, th):
             "cannot tell which")
     eligible = row.get("eligible_users") or 0
     adopters = row.get("adopters") or 0
-    if eligible < th.min_eligible or adopters < th.min_adopters:
+    if eligible < th.min_eligible:
         return "insufficient-data", (
-            "denominator too small for a rate (eligible=%s, adopters=%s)"
-            % (eligible, adopters))
+            "only %s eligible users, too few to support a rate" % eligible)
+    # Zero adopters against a large denominator is a STRONG result, not a
+    # missing one. The adopter floor exists to stop depth being computed over a
+    # handful of people, so it must not swallow a genuine dormant case.
     if adopters == 0:
-        return "dormant", "nobody used it in the window"
+        return "dormant", (
+            "nobody among %s eligible users touched it in the window"
+            % eligible)
+    if adopters < th.min_adopters:
+        return "insufficient-data", (
+            "only %s adopters, too few to compute depth over" % adopters)
     breadth = row.get("breadth_pct")
     depth = row.get("depth_pct")
     if breadth is None:
@@ -249,6 +256,7 @@ def build_from_aggregate(rows, fields):
 
 
 def build_from_events(rows, fields, revenue, default_eligible):
+    """Returns (per-event metrics, distinct users, observed window in days)."""
     present = set(fields)
     alt_user = {"user_id", "distinct_id", "user", "person_id"} & present
     alt_event = {"event", "event_name", "name"} & present
@@ -283,8 +291,10 @@ def build_from_events(rows, fields, revenue, default_eligible):
         all_users.add(user)
 
     midpoint = None
+    window_days = None
     if stamps:
         midpoint = (min(stamps) + max(stamps)) // 2
+        window_days = int((max(stamps) - min(stamps)) / 86400) or 1
 
     out = {}
     for event, bucket in per_event.items():
@@ -338,7 +348,7 @@ def build_from_events(rows, fields, revenue, default_eligible):
             "arr_touching": arr_touching,
             "top_account_arr_share_pct": top_account_share,
         }
-    return out, len(all_users)
+    return out, len(all_users), window_days
 
 
 def main():
@@ -350,6 +360,10 @@ def main():
     ap.add_argument("--revenue", help="account_id,arr CSV")
     ap.add_argument("--eligible", type=int, default=None,
                     help="eligible-user denominator for --events mode")
+    ap.add_argument("--window-days", type=int, default=None,
+                    help="length of the observation window in days. Measured "
+                         "from timestamps in --events mode; declare it in "
+                         "--aggregate mode or the dormancy gate cannot clear")
     ap.add_argument("--min-eligible", type=int, default=30)
     ap.add_argument("--min-adopters", type=int, default=5)
     ap.add_argument("--low-breadth", type=float, default=10.0)
@@ -383,6 +397,7 @@ def main():
                 revenue[account] = revenue.get(account, 0.0) + arr
 
     total_users_in_export = None
+    measured_window = None
     if args.aggregate:
         rows, fields = read_csv(args.aggregate)
         metrics = build_from_aggregate(rows, fields)
@@ -390,7 +405,7 @@ def main():
         mode = "aggregate"
     else:
         rows, fields = read_csv(args.events)
-        metrics, total_users_in_export = build_from_events(
+        metrics, total_users_in_export, measured_window = build_from_events(
             rows, fields, revenue, args.eligible)
         source = os.path.basename(args.events)
         mode = "events"
@@ -451,6 +466,11 @@ def main():
                     if b.get("arr_touching") is not None]
             if arrs:
                 row["arr_touching"] = max(arrs)
+            if row.get("arr_touching") is not None and revenue:
+                total_arr = sum(revenue.values())
+                if total_arr:
+                    row["arr_share_pct"] = round(
+                        100 * row["arr_touching"] / total_arr, 1)
             tops = [b.get("top_account_arr_share_pct") for b in buckets
                     if b.get("top_account_arr_share_pct") is not None]
             if tops:
@@ -490,10 +510,18 @@ def main():
     for row in out_rows:
         tally[row["signature"]] = tally.get(row["signature"], 0) + 1
 
+    window_days = args.window_days or measured_window
     report = {
         "root": root,
         "source": source,
         "input_mode": mode,
+        "window_days": window_days,
+        "window_days_basis": (
+            "declared with --window-days" if args.window_days
+            else ("measured from timestamps in the export" if measured_window
+                  else "unknown: not declared and not derivable from this input")),
+        "total_arr": round(sum(revenue.values()), 2) if revenue else None,
+        "accounts_with_arr": len(revenue) or None,
         "features": len(out_rows),
         "signature_counts": [{"signature": k, "features": v}
                              for k, v in sorted(tally.items())],
@@ -520,6 +548,15 @@ def main():
             "distinct users present in the export; that is an active-user "
             "denominator, not an eligible-user one, and it overstates breadth"
             % total_users_in_export))
+    if not window_days:
+        report["caveats"].append(
+            "the observation window is unknown, so a quiet feature cannot be "
+            "distinguished from a seasonal one; pass --window-days")
+    elif window_days < 365:
+        report["caveats"].append(
+            "the window is %d days, under a full year, so annual-cycle "
+            "features (tax, renewals, reporting) can look dormant"
+            % window_days)
     if unmapped:
         report["caveats"].append(
             "%d event names in the data are not mapped to any feature; the "

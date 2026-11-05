@@ -15,6 +15,8 @@ SCRIPTS = os.path.join(ROOT, "scripts")
 FIXTURE = os.path.join(HERE, "fixtures", "sampleapp")
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 
+import deps  # noqa: E402
+import gates as G  # noqa: E402
 import inv  # noqa: E402
 import sdyaml  # noqa: E402
 
@@ -271,7 +273,7 @@ class RepoCase(unittest.TestCase):
                        "public_api": "unknown"}, "notes": ""},
             {"id": "reports", "name": "Reports", "status": "active",
              "paths": ["app/reports/**"], "events": ["report_viewed"],
-             "owner": "", "tags": [],
+             "owner": "", "tags": [], "migration": "point users at dashboard",
              "gates": {"contractual": "no", "regulated": "no",
                        "public_api": "no"}, "notes": ""},
             {"id": "weekly-digest", "name": "Weekly digest", "status": "active",
@@ -587,6 +589,509 @@ class DetectTests(unittest.TestCase):
             self.assertTrue(any("no analytics SDK" in n
                                 for n in report["notes"]))
 
+
+
+
+class DepsTests(unittest.TestCase):
+    def test_normalise(self):
+        cases = {
+            "./lib/stripe": "lib/stripe",
+            "@/app/billing/page.tsx": "app/billing/page",
+            "app.billing.models": "app/billing/models",
+            "../../workers/digest.py": "workers/digest",
+            "@/components/ui/index.ts": "components/ui",
+        }
+        for raw, want in cases.items():
+            self.assertEqual(deps.normalise(raw), want, "on %r" % raw)
+
+    def test_tails_excludes_single_components(self):
+        # Matching on "page" or "utils" alone would couple half a codebase.
+        self.assertEqual(deps.tails("app/billing/page.tsx"),
+                         ["app/billing/page", "billing/page"])
+        self.assertNotIn("page", deps.tails("app/billing/page.tsx"))
+
+    def test_inbound_detects_a_crossing_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "feat"))
+            with open(os.path.join(tmp, "feat", "core.ts"), "w") as fh:
+                fh.write("export const x = 1;\n")
+            with open(os.path.join(tmp, "outside.ts"), "w") as fh:
+                fh.write("import { x } from './feat/core';\n")
+            index = deps.DepIndex(tmp, ["feat/core.ts", "outside.ts"],
+                                  inv.read_text)
+            hits, total = index.inbound(["feat/core.ts"])
+            self.assertEqual(total, 1)
+            self.assertEqual(hits[0]["from"], "outside.ts")
+
+    def test_inbound_ignores_imports_within_the_feature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "feat"))
+            with open(os.path.join(tmp, "feat", "core.ts"), "w") as fh:
+                fh.write("export const x = 1;\n")
+            with open(os.path.join(tmp, "feat", "ui.ts"), "w") as fh:
+                fh.write("import { x } from './feat/core';\n")
+            index = deps.DepIndex(tmp, ["feat/core.ts", "feat/ui.ts"],
+                                  inv.read_text)
+            _, total = index.inbound(["feat/core.ts", "feat/ui.ts"])
+            self.assertEqual(total, 0)
+
+
+class RegulatedClassifierTests(unittest.TestCase):
+    def test_matches_obligation_shaped_names(self):
+        for fid, name in [("audit-log", "Audit log"), ("invoices", "Invoices"),
+                          ("exports", "CSV export of data"),
+                          ("sso", "SSO / SAML login"),
+                          ("account-deletion", "Delete my account"),
+                          ("a11y", "Accessibility options")]:
+            self.assertTrue(G.regulated_terms_matching({"id": fid, "name": name}),
+                            "should have matched: %s" % fid)
+
+    def test_does_not_match_ordinary_features(self):
+        for fid, name in [("dashboard", "Dashboard"), ("reports", "Reports"),
+                          ("weekly-digest", "Weekly digest email"),
+                          ("themes", "Dark mode")]:
+            self.assertEqual(G.regulated_terms_matching({"id": fid, "name": name}),
+                             [], "should not have matched: %s" % fid)
+
+    def test_plural_is_matched(self):
+        self.assertIn("invoice",
+                      G.regulated_terms_matching({"id": "invoices",
+                                                  "name": "Invoices"}))
+
+
+class GateUnitTests(unittest.TestCase):
+    def ctx(self, **over):
+        kwargs = {"window_days": 400, "has_revenue": True}
+        kwargs.update(over)
+        return G.Context(**kwargs)
+
+    def test_dormancy_fails_on_a_short_window(self):
+        gate = G.gate_dormancy({}, {"adopters": 0}, self.ctx(window_days=90))
+        self.assertEqual(gate["state"], G.FAIL)
+        self.assertIn("full 365-day", gate["because"])
+
+    def test_dormancy_fails_when_the_feature_has_live_users(self):
+        gate = G.gate_dormancy({}, {"adopters": 190, "breadth_pct": 4.0},
+                               self.ctx())
+        self.assertEqual(gate["state"], G.FAIL)
+        self.assertIn("product decision", gate["because"])
+
+    def test_dormancy_passes_on_zero_adopters_over_a_full_cycle(self):
+        gate = G.gate_dormancy({}, {"adopters": 0}, self.ctx())
+        self.assertEqual(gate["state"], G.PASS)
+
+    def test_dormancy_unknown_without_a_window(self):
+        gate = G.gate_dormancy({}, {"adopters": 0}, self.ctx(window_days=None))
+        self.assertEqual(gate["state"], G.UNKNOWN)
+
+    def test_instrumentation_fails_on_blind_spot_and_no_data(self):
+        for sig in ("blind-spot", "no-data", "insufficient-data"):
+            gate = G.gate_instrumentation({}, {"signature": sig}, self.ctx())
+            self.assertEqual(gate["state"], G.FAIL, "on %s" % sig)
+
+    def test_regulatory_blocks_an_obligation_name(self):
+        feature = {"id": "exports", "name": "CSV export",
+                   "gates": {"regulated": "unknown"}}
+        self.assertEqual(G.gate_regulatory(feature, {}, self.ctx())["state"],
+                         G.FAIL)
+
+    def test_regulatory_needs_a_written_reason_to_be_overridden(self):
+        feature = {"id": "exports", "name": "CSV export",
+                   "gates": {"regulated": "no"}, "notes": ""}
+        self.assertEqual(G.gate_regulatory(feature, {}, self.ctx())["state"],
+                         G.UNKNOWN)
+        feature["notes"] = "not a GDPR export; it exports chart images only"
+        self.assertEqual(G.gate_regulatory(feature, {}, self.ctx())["state"],
+                         G.PASS)
+
+    def test_regulatory_honours_an_explicit_yes(self):
+        feature = {"id": "x", "name": "Thing", "gates": {"regulated": "yes"}}
+        self.assertEqual(G.gate_regulatory(feature, {}, self.ctx())["state"],
+                         G.FAIL)
+
+    def test_unanswered_gates_are_unknown_not_pass(self):
+        feature = inv.blank_feature("x", "Thing")
+        results = G.evaluate(feature, {"signature": "dormant", "adopters": 0},
+                             self.ctx())
+        self.assertEqual(results["contractual"]["state"], G.UNKNOWN)
+        self.assertFalse(G.summarise(results)["all_clear"])
+
+    def test_revenue_blocks_on_concentration_in_one_account(self):
+        usage = {"arr_touching": 100000.0, "arr_share_pct": 1.0,
+                 "top_account_arr_share_pct": 95.0}
+        gate = G.gate_revenue({}, usage, self.ctx())
+        self.assertEqual(gate["state"], G.FAIL)
+        self.assertIn("single account", gate["because"])
+
+    def test_revenue_blocks_above_the_arr_share_limit(self):
+        usage = {"arr_touching": 100000.0, "arr_share_pct": 40.0,
+                 "top_account_arr_share_pct": 10.0}
+        self.assertEqual(G.gate_revenue({}, usage, self.ctx())["state"], G.FAIL)
+
+    def test_revenue_unknown_without_revenue_data(self):
+        gate = G.gate_revenue({}, {"adopters": 0}, self.ctx(has_revenue=False))
+        self.assertEqual(gate["state"], G.UNKNOWN)
+
+    def test_migration_passes_when_there_is_nobody_to_migrate(self):
+        gate = G.gate_migration({}, {"adopters": 0}, self.ctx())
+        self.assertEqual(gate["state"], G.PASS)
+
+    def test_migration_unknown_when_users_exist_and_no_plan_recorded(self):
+        gate = G.gate_migration({}, {"adopters": 50}, self.ctx())
+        self.assertEqual(gate["state"], G.UNKNOWN)
+
+    def test_migration_passes_with_a_recorded_plan(self):
+        gate = G.gate_migration({"migration": "export then redirect"},
+                                {"adopters": 50}, self.ctx())
+        self.assertEqual(gate["state"], G.PASS)
+
+
+class VerdictTests(RepoCase):
+    AGG = ("event,eligible_users,adopters,repeat_adopters\n"
+           "checkout_started,4820,1960,1310\n"
+           "invoice_downloaded,4820,340,201\n"
+           "report_viewed,4820,190,160\n"
+           "notification_pref_saved,4820,0,0\n"
+           "export_downloaded,4820,0,0\n")
+    REV = "account_id,arr\nacme,120000\nsmall,4000\n"
+
+    def verdict(self, *extra):
+        agg = self.csv("v_agg.csv", self.AGG)
+        rev = self.csv("v_rev.csv", self.REV)
+        report, _, err = run_json(
+            "verdict_report.py", "--root", self.repo, "--all-history",
+            "--aggregate", agg, "--revenue", rev, "--window-days", "400",
+            *extra)
+        self.assertEqual(err.strip(), "")
+        return {r["id"]: r for r in report["rows"]}, report
+
+    def test_a_dormant_gate_clearing_feature_reaches_cut(self):
+        rows, _ = self.verdict()
+        self.assertEqual(rows["notifications"]["bucket"], "cut")
+        self.assertEqual(rows["notifications"]["gates_failed"], [])
+        self.assertEqual(rows["notifications"]["gates_unknown"], [])
+        self.assertIn("red_team_brief", rows["notifications"])
+
+    def test_cut_rows_carry_urgency_from_cost(self):
+        rows, _ = self.verdict()
+        self.assertIn(rows["notifications"]["urgency"],
+                      ("low", "medium", "high"))
+
+    def test_a_regulated_name_is_blocked_not_cut(self):
+        rows, _ = self.verdict()
+        self.assertEqual(rows["exports"]["bucket"], "blocked")
+        self.assertIn("regulatory", rows["exports"]["gates_unknown"]
+                      + rows["exports"]["gates_failed"])
+
+    def test_discoverability_goes_to_reposition_and_suggests_a_survey(self):
+        rows, _ = self.verdict()
+        self.assertEqual(rows["reports"]["bucket"], "reposition")
+        self.assertIn("survey", rows["reports"]["cheapest_next_step"])
+
+    def test_a_feature_with_no_events_is_blind_spot(self):
+        rows, _ = self.verdict()
+        self.assertEqual(rows["weekly-digest"]["bucket"], "blind-spot")
+
+    def test_a_busy_feature_is_kept(self):
+        rows, _ = self.verdict()
+        self.assertEqual(rows["billing"]["bucket"], "blocked")
+        self.assertIn("dormancy", rows["billing"]["gates_failed"])
+
+    def test_without_revenue_data_nothing_reaches_cut(self):
+        agg = self.csv("v_agg2.csv", self.AGG)
+        report, _, _ = run_json("verdict_report.py", "--root", self.repo,
+                                "--all-history", "--aggregate", agg,
+                                "--window-days", "400")
+        rows = {r["id"]: r for r in report["rows"]}
+        self.assertEqual(rows["notifications"]["bucket"], "blocked")
+        self.assertIn("revenue", rows["notifications"]["gates_unknown"])
+
+    def test_a_short_window_blocks_everything_on_dormancy(self):
+        agg = self.csv("v_agg3.csv", self.AGG)
+        rev = self.csv("v_rev3.csv", self.REV)
+        report, _, _ = run_json("verdict_report.py", "--root", self.repo,
+                                "--all-history", "--aggregate", agg,
+                                "--revenue", rev, "--window-days", "30")
+        rows = {r["id"]: r for r in report["rows"]}
+        self.assertEqual(rows["notifications"]["bucket"], "blocked")
+        self.assertIn("dormancy", rows["notifications"]["gates_failed"])
+
+    def test_no_usage_data_means_everything_is_unassessable(self):
+        report, _, _ = run_json("verdict_report.py", "--root", self.repo,
+                                "--all-history")
+        buckets = {b["bucket"]: b["features"] for b in report["buckets"]}
+        self.assertEqual(buckets["cut"], 0)
+        self.assertEqual(buckets["blind-spot"], report["features"])
+
+    def test_every_row_names_its_missing_evidence_and_next_step(self):
+        rows, _ = self.verdict()
+        for fid, row in rows.items():
+            self.assertIn("missing_evidence", row, fid)
+            if row["bucket"] in ("blocked", "blind-spot", "reposition"):
+                self.assertTrue(row["cheapest_next_step"],
+                                "%s has no next step" % fid)
+
+    def test_report_states_the_retention_caveat(self):
+        _, report = self.verdict()
+        self.assertTrue(any("no published evidence" in c
+                            for c in report["caveats"]))
+
+
+class SunsetTests(RepoCase):
+    def plan(self, feature, *extra):
+        agg = self.csv("s_agg.csv", VerdictTests.AGG)
+        rev = self.csv("s_rev.csv", VerdictTests.REV)
+        code, out, err = run_script(
+            "sunset_plan.py", feature, "--root", self.repo, "--all-history",
+            "--aggregate", agg, "--revenue", rev, "--window-days", "400",
+            "--stdout", *extra)
+        self.assertEqual(code, 0, err)
+        return out
+
+    def test_a_cleared_feature_gets_a_dated_schedule(self):
+        body = self.plan("notifications")
+        self.assertIn("## Schedule", body)
+        self.assertIn("Flag off first, delete last", body)
+        self.assertIn("## Abort triggers", body)
+        self.assertNotIn("## Stop:", body)
+
+    def test_a_blocked_feature_opens_with_the_blockers(self):
+        body = self.plan("exports")
+        self.assertIn("## Stop:", body)
+        self.assertIn("Do not schedule a removal", body)
+        self.assertLess(body.index("## Stop:"), body.index("## Evidence"))
+
+    def test_the_plan_declares_itself_a_draft(self):
+        body = self.plan("notifications")
+        self.assertIn("DRAFT", body)
+        self.assertIn("no code has been changed", body)
+
+    def test_the_plan_states_the_churn_blind_spot(self):
+        body = self.plan("notifications")
+        self.assertIn("Churned users appear in no usage export", body)
+
+    def test_unknown_feature_is_rejected_with_the_known_ids(self):
+        code, _, err = run_script("sunset_plan.py", "nope", "--root", self.repo)
+        self.assertEqual(code, 2)
+        self.assertIn("billing", err)
+
+    def test_writing_to_a_file_reports_the_path(self):
+        agg = self.csv("s_agg2.csv", VerdictTests.AGG)
+        report, _, _ = run_json(
+            "sunset_plan.py", "notifications", "--root", self.repo,
+            "--all-history", "--aggregate", agg, "--window-days", "400")
+        self.assertEqual(report["wrote"], ".stripdown/sunset/notifications.md")
+        self.assertIn("draft", report["status"])
+        self.assertTrue(os.path.exists(
+            os.path.join(self.repo, ".stripdown", "sunset",
+                         "notifications.md")))
+
+
+class ScopeDiffTests(RepoCase):
+    def test_measures_off_path_share_of_activity(self):
+        report, _, err = run_json("scope_diff.py", "--root", self.repo,
+                                  "--path", "billing")
+        self.assertEqual(err.strip(), "")
+        self.assertTrue(report["critical_path_declared"])
+        self.assertEqual(report["features_on_path"], 1)
+        self.assertGreater(report["features_off_path"], 1)
+        self.assertIsNotNone(report["off_path_shares"]["off_path_churn_pct"])
+        self.assertIn("headline", report)
+
+    def test_timeline_is_ordered_by_first_appearance(self):
+        report, _, _ = run_json("scope_diff.py", "--root", self.repo,
+                                "--path", "billing")
+        dates = [t["first_seen"] for t in report["timeline"]]
+        self.assertEqual(dates, sorted(dates))
+        self.assertIn("exports", [t["id"] for t in report["timeline"]])
+
+    def test_works_without_a_declared_path_and_says_so(self):
+        report, _, _ = run_json("scope_diff.py", "--root", self.repo)
+        self.assertFalse(report["critical_path_declared"])
+        self.assertTrue(any("no critical path declared" in c
+                            for c in report["caveats"]))
+        self.assertTrue(report["timeline"])
+
+    def test_rejects_an_unknown_feature_id(self):
+        code, _, err = run_script("scope_diff.py", "--root", self.repo,
+                                  "--path", "ghost")
+        self.assertEqual(code, 2)
+        self.assertIn("not in the inventory", err)
+
+    def test_says_off_path_is_not_an_argument_for_removal(self):
+        report, _, _ = run_json("scope_diff.py", "--root", self.repo,
+                                "--path", "billing")
+        self.assertTrue(any("not an argument for removal" in c
+                            for c in report["caveats"]))
+
+
+class ClaimsTests(unittest.TestCase):
+    def write(self, tmp, body):
+        os.makedirs(os.path.join(tmp, ".stripdown"), exist_ok=True)
+        with open(os.path.join(tmp, ".stripdown", "demand.yml"), "w") as fh:
+            fh.write(body)
+
+    def check(self, body):
+        tmp = tempfile.mkdtemp()
+        try:
+            self.write(tmp, body)
+            code, out, err = run_script("validate_claims.py", "--root", tmp)
+            return json.loads(out) if out.strip() else {}, code
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_a_well_cited_ledger_is_valid(self):
+        report, code = self.check(
+            "version: 1\n"
+            "claims:\n"
+            "  - id: c1\n"
+            "    claim: 'Competitor ships bulk export'\n"
+            "    grade: B\n"
+            "    source: 'https://example.com/pricing'\n"
+            "    fetched: '2026-11-05'\n"
+            "    kind: competitor\n"
+            "    supports: []\n")
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(code, 0)
+
+    def test_grade_d_may_not_justify_a_feature(self):
+        report, code = self.check(
+            "version: 1\n"
+            "claims:\n"
+            "  - id: c1\n"
+            "    claim: 'Teams are desperate for AI dashboards'\n"
+            "    grade: D\n"
+            "    source: ''\n"
+            "    kind: signal\n"
+            "    supports: [dashboard]\n")
+        self.assertEqual(code, 2)
+        self.assertTrue(any("may not justify anything" in e
+                            for e in report["errors"]))
+
+    def test_grade_d_must_be_a_question(self):
+        report, code = self.check(
+            "version: 1\n"
+            "claims:\n"
+            "  - id: c1\n"
+            "    claim: 'The market wants scheduled exports'\n"
+            "    grade: D\n"
+            "    source: ''\n"
+            "    supports: []\n")
+        self.assertEqual(code, 2)
+        self.assertTrue(any("phrased as a question" in e
+                            for e in report["errors"]))
+
+    def test_grade_d_as_a_question_is_accepted(self):
+        report, _ = self.check(
+            "version: 1\n"
+            "claims:\n"
+            "  - id: c1\n"
+            "    claim: 'Would teams pay for scheduled exports?'\n"
+            "    grade: D\n"
+            "    source: ''\n"
+            "    supports: []\n")
+        self.assertEqual(report["errors"], [])
+
+    def test_grade_b_needs_a_url_and_a_date(self):
+        report, code = self.check(
+            "version: 1\n"
+            "claims:\n"
+            "  - id: c1\n"
+            "    claim: 'Competitor ships export'\n"
+            "    grade: B\n"
+            "    source: 'their docs'\n"
+            "    supports: []\n")
+        self.assertEqual(code, 2)
+        self.assertTrue(any("https URL" in e for e in report["errors"]))
+        self.assertTrue(any("fetched:" in e for e in report["errors"]))
+
+    def test_grade_a_cannot_be_an_external_url(self):
+        report, code = self.check(
+            "version: 1\n"
+            "claims:\n"
+            "  - id: c1\n"
+            "    claim: 'Our churn is concentrated off-path'\n"
+            "    grade: A\n"
+            "    source: 'https://example.com/thing'\n"
+            "    supports: []\n")
+        self.assertEqual(code, 2)
+        self.assertTrue(any("cannot be grade A" in e
+                            for e in report["errors"]))
+
+    def test_discouraged_sources_are_warned_about(self):
+        report, _ = self.check(
+            "version: 1\n"
+            "claims:\n"
+            "  - id: c1\n"
+            "    claim: 'Reviewers complain about onboarding'\n"
+            "    grade: C\n"
+            "    source: 'https://www.g2.com/products/x/reviews'\n"
+            "    fetched: '2026-11-05'\n"
+            "    supports: []\n")
+        self.assertTrue(any("prohibits scraping" in w
+                            for w in report["warnings"]))
+
+    def test_a_ledger_with_nothing_citable_warns(self):
+        report, _ = self.check(
+            "version: 1\n"
+            "claims:\n"
+            "  - id: c1\n"
+            "    claim: 'Is there demand for this?'\n"
+            "    grade: D\n"
+            "    source: ''\n"
+            "    supports: []\n")
+        self.assertTrue(any("nothing citable" in w or "no claim is usable" in w
+                            for w in report["warnings"]))
+
+
+class DormancyRegressionTests(RepoCase):
+    def test_zero_adopters_against_a_large_denominator_is_dormant(self):
+        # Regression: zero adopters out of thousands of eligible users is a
+        # STRONG result. It was previously reported as insufficient-data,
+        # because the adopter floor meant for depth was swallowing it.
+        path = self.csv("dormant.csv",
+                        "event,eligible_users,adopters,repeat_adopters\n"
+                        "notification_pref_saved,4820,0,0\n")
+        report, _, _ = run_json("usage_report.py", "--root", self.repo,
+                                "--aggregate", path)
+        rows = {r["id"]: r for r in report["rows"]}
+        self.assertEqual(rows["notifications"]["signature"], "dormant")
+        self.assertIn("4820", rows["notifications"]["signature_because"])
+
+    def test_a_tiny_denominator_is_still_insufficient_data(self):
+        path = self.csv("tiny.csv",
+                        "event,eligible_users,adopters,repeat_adopters\n"
+                        "notification_pref_saved,4,0,0\n")
+        report, _, _ = run_json("usage_report.py", "--root", self.repo,
+                                "--aggregate", path)
+        rows = {r["id"]: r for r in report["rows"]}
+        self.assertEqual(rows["notifications"]["signature"],
+                         "insufficient-data")
+
+
+class UsageWindowTests(RepoCase):
+    def test_window_is_measured_from_event_timestamps(self):
+        lines = ["user_id,event,timestamp"]
+        for i in range(40):
+            lines.append("u%d,report_viewed,2026-01-10T10:00:00" % i)
+            lines.append("u%d,report_viewed,2026-06-10T10:00:00" % i)
+        path = self.csv("win.csv", "\n".join(lines) + "\n")
+        report, _, _ = run_json("usage_report.py", "--root", self.repo,
+                                "--events", path, "--eligible", "1000")
+        self.assertGreater(report["window_days"], 140)
+        self.assertIn("measured from timestamps", report["window_days_basis"])
+        self.assertTrue(any("under a full year" in c
+                            for c in report["caveats"]))
+
+    def test_unknown_window_is_flagged(self):
+        path = self.csv("win2.csv",
+                        "event,eligible_users,adopters,repeat_adopters\n"
+                        "report_viewed,4820,190,160\n")
+        report, _, _ = run_json("usage_report.py", "--root", self.repo,
+                                "--aggregate", path)
+        self.assertIsNone(report["window_days"])
+        self.assertTrue(any("observation window is unknown" in c
+                            for c in report["caveats"]))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

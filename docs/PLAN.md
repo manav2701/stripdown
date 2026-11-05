@@ -2,7 +2,7 @@
 
 **A Claude Code plugin that helps you find the features you should stop paying for.**
 
-Status: **v0.1 and v0.2 are built and tested** (`init`, `inventory`, `cost`, `usage`) — see the [README](../README.md) to install and run them. v0.3 onward is still plan.
+Status: **v0.1 through v0.4 are built and tested** (`init`, `inventory`, `cost`, `usage`, `verdict`, `sunset`, `survey`, `demand`) — see the [README](../README.md) to install and run them. Only v0.5 remains plan.
 
 This document is the design, the research behind it, and an honest account of which parts of the idea work, which parts don't, and what we're doing about the parts that don't. Where the implementation has since settled a question the plan left open, the roadmap section says so.
 

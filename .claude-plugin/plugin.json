@@ -1,9 +1,11 @@
 {
   "name": "strip-down",
   "displayName": "strip-down",
-  "version": "0.2.0",
-  "description": "Builds a feature inventory from your codebase, prices each feature from git history, and joins both against product usage data to show which features are earning their keep.",
-  "author": { "name": "manav2701" },
+  "version": "0.4.0",
+  "description": "Builds a feature inventory from your codebase, prices each feature from git history, joins both against product usage, and applies seven kill gates before it will call anything a removal candidate.",
+  "author": {
+    "name": "manav2701"
+  },
   "homepage": "https://github.com/manav2701/stripdown",
   "repository": "https://github.com/manav2701/stripdown",
   "license": "MIT",
